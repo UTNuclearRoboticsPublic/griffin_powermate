@@ -26,227 +26,274 @@
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
 // SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-/** @file griffin_powermate.cpp
- *  On /powermate_griffin topic it publishes PowermateEvent messages that contain
- *  direction and integral of the turn wheel as well as the information about push
- *  button being pressed or depressed.
+/** @file griffin_powermate.h
+ *  On /griffin_powermate/events topic it publishes griffin_powermate::PowermateEvent
+ *  messages that contain direction and integral of the turn wheel as well as the 
+ *  information about push button being pressed or depressed.
  * 
- *  If you get permission denied when starting this node, use "ls -l /dev/input/event*"
- *  to learn which group can access the events. Then add your username to this group with
- *  "sudo usermod -a -G group_name user_name"
+ *  NOTE
+ *  If you get permission denied when running this ROS node, use
+ * 	ls -l /dev/input/event*
+ *  to learn which group can access linux input events. Then add your username to
+ *  that group by issuing
+ *  	sudo usermod -a -G [group_name] [user_name]
+ *  You need to log out and back in for these changes to take effect.
  * 
  *  @author karl.kruusamae(at)utexas.edu
  */
 
-/*	This code is originally from http://sowerbutts.com/powermate/
- *	Comments added by karl.kruusamae(at)utexas.edu
- *	Modifications to make it into a ROS publisher and other changes made by karl.kruusamae(at)utexas.edu
+#include "griffin_powermate/griffin_powermate.h"
+
+/** Opens the input device and checks whether its meaningful name (ie, EVIOCGNAME in ioctl()) is listed in valid_substrings_.
+ *  @param device_path file name for linux event.
+ *  @return file descriptor to PowerMate event if all checks out, otherwise -1.
  */
-
-#include <linux/input.h>
-#include <string.h>
-#include <errno.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <glob.h>	// for counting files in a dir (needed for counting event files in /dev/input)
-
-#include "ros/ros.h"
-#include "std_msgs/String.h"
-
-#include "griffin_powermate/PowermateEvent.h"
-
-#define NUM_VALID_PREFIXES 2
-#define BUFFER_SIZE 32
-
-long long total_shift = 0;	///< Integrated shift of Powermate dial.
-//signed char dir = 0;
-signed char pressed = 0;	///< True when Powermate dial is pressed.
-
-/** Array of valid prefixes for Griffin devices. */
-static const char *valid_prefix[NUM_VALID_PREFIXES] = {
-  "Griffin PowerMate",
-  "Griffin SoundKnob"
-};
-
-/** Opens the input device and checks whether its meaningful name (ie, EVIOCGNAME in ioctl()) is Griffin PowerMate.
- *  @param dev file name for linux event.
- *  @param mode open file mode.
- *  @return file descriptor if all checks out, otherwise -1.
- */
-int open_powermate(const char *dev, int mode) {
-//  ROS_INFO("Opening dev %s", dev);
-  int fd = open(dev, mode);	//file descriptor to the opened device
-  int i;
-  char name[255];		// meaningful, ie EVIOCGNAME name
-
-  if(fd < 0){			// if failed to open dev
-    fprintf(stderr, "Unable to open \"%s\": %s\n", dev, strerror(errno));
+int PowerMate::openPowerMate(const char *device_path)
+{
+  printf("Opening device: %s \n", device_path);
+  
+  // Open device at device_path for READONLY and get file descriptor 
+  int fd = open(device_path, O_RDONLY);
+  
+  // If failed to open device at device_path
+  if(fd < 0)
+  {
+    ROS_ERROR("Failed to open \"%s\"\n", device_path);
     return -1;
   }
 
-  if(ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0){ 	// fetches the meaningful (ie. EVIOCGNAME) name
-    fprintf(stderr, "\"%s\": EVIOCGNAME failed: %s\n", dev, strerror(errno));
+  // Meaningful, i.e., EVIOCGNAME name
+  char name[255];
+  // Fetch the meaningful (i.e., EVIOCGNAME) name
+  if(ioctl(fd, EVIOCGNAME(sizeof(name)), name) < 0)
+  {
+    ROS_ERROR("\"%s\": EVIOCGNAME failed.", device_path);
     close(fd);
-    return -1;						// returns -1 if unable to fetch the meaningful name
+    // Returns -1 if failed to fetch the meaningful name
+    return -1;
   }
 
-  //checks now if the meaningful name matches one listed in valid_prefix
-  // it's the correct device if the prefix matches what we expect it to be:
-  for(i=0; i<NUM_VALID_PREFIXES; i++)
-    if( !strncasecmp(name, valid_prefix[i], strlen(valid_prefix[i])) ) {
-      ROS_INFO("Found %s device. Starting to read ...", valid_prefix[i]);
-      return fd;					// if everything checks out, returns the file  tdescriptor
+  // Let's check if the meaningful name matches one listed in valid_substrings_
+  std::ostringstream sstream;
+  // Convert name given as char* to stringstream
+  sstream << name;
+  // stringstream to string
+  std::string name_as_string = sstream.str();
+  int i;
+  for (i=0; i < valid_substrings_.size(); i++)
+  {
+    // Does the meaningful name contain a predefined valid substring?
+    std::size_t found = name_as_string.find( valid_substrings_[i] );
+    if (found!=std::string::npos)
+    {
+      // if everything checks out, print on screen and return the file descriptor
+      ROS_INFO("Found \x1b[1;34m'%s'\x1b[0m device. Starting to read ...\n", name);
+      return fd;
     } // end if
+  } // end for
+  
   close(fd);
   return -1;
-} // end open_powermate
+} // end openPowerMate
 
-/** Goes through all the event files in /dev/input/ to locate powermate.
- *  @param mode open file mode.
+/** Goes through all the event files in /dev/input/ to locate Griffin PowerMate USB.
  *  @return file descriptor if all checks out, otherwise -1.
  */
-int find_powermate(int mode) {
-  int i, r;
-
-  // using glob() [see: http://linux.die.net/man/3/glob ] for getting event files in /dev/input/
+int PowerMate::findPowerMate()
+{
+  // Using glob() [see: http://linux.die.net/man/3/glob ] for getting event files in /dev/input/
   glob_t gl;
-  int num_event_dev = 0;					// number of event files found in /dev/input/
-  if(glob("/dev/input/event*", GLOB_NOSORT, NULL, &gl) == 0)	// counts for filenames that match the given pattern
-    num_event_dev = gl.gl_pathc;				// get number of event files
+  // Number of event files found in /dev/input/
+  int num_event_dev = 0;
+  // Counts for filenames that match the given pattern
+  if(glob("/dev/input/event*", GLOB_NOSORT, NULL, &gl) == 0)
+  {
+    // Get number of event files
+    num_event_dev = gl.gl_pathc;
+  }
 
-  for(i=0; i<num_event_dev; i++){				// go through all found event files
-    r = open_powermate(gl.gl_pathv[i], mode);			// try to open an event file
-    if(r >= 0)							// if opened file is a powermate event return file descriptor
-      return r;
+  int i, r;
+  // Goes through all the found event files
+  for(i = 0; i < num_event_dev; i++)
+  {
+    // Tries to open an event file as a PowerMate device
+    r = openPowerMate(gl.gl_pathv[i]);
+    // If opened file is PowerMate event, return file descriptor
+    if(r >= 0) return r;
   } // for
-  globfree(&gl);						// free memory allocated for globe struct
-
-  return -1;							// return error -1 otherwise
-} // end find_powermate
-
-/** Reads the event type and publishes relevant data.
- *  @param ev input event.
- *  @param pub ROS publisher.
- */
-void process_event(struct input_event *ev, ros::Publisher& pub) {
-#ifdef VERBOSE
-  fprintf(stderr, "type=0x%04x, code=0x%04x, value=%d\n",
-	  ev->type, ev->code, (int)ev->value);
-#endif
-
-  griffin_powermate::PowermateEvent msg;			// msg will be published by ROS publisher
-
-// Event information about Griffin PowerMate from evtest
-//
-// Input device name: "Griffin PowerMate"
-// Supported events:
-//	Event type 0 (EV_SYN)
-//	Event type 1 (EV_KEY)
-//		Event code 256 (BTN_0)
-//	Event type 2 (EV_REL)
-//		Event code 7 (REL_DIAL)
-//	Event type 4 (EV_MSC)
-//		Event code 1 (MSC_PULSELED)
   
-  switch(ev->type){				// switch to a case based on the event type
+  // free memory allocated for globe struct
+  globfree(&gl);
+
+  // return error -1 because no PowerMate device was found
+  return -1;
+} // end findPowerMate
+
+/** Closes the device specificed by descriptor_. */
+void PowerMate::closePowerMate()
+{
+  printf("Closing PowerMate device.\n");
+  close(descriptor_);
+  return;
+}
+
+/** Checks if the PowerMate event file has been succesfully opened.
+ *  @return TRUE when descriptor_ is not negative, FALSE otherwise.
+ */
+bool PowerMate::isReadable ()
+{
+  if (descriptor_ < 0) return false;
+  return true;
+}
+
+/** Processes the event data and publishes it as PowermateEvent message.
+ *  @param ev input event.
+ *  @param ros_publisher ROS publisher.
+ */
+void PowerMate::processEvent(struct input_event *ev, ros::Publisher& ros_publisher)
+{
+  // PowermateEvent ROS message
+  griffin_powermate::PowermateEvent ros_message;
+
+  // ---- Event information about Griffin PowerMate USB from evtest ----
+  //
+  // Input device name: "Griffin PowerMate"
+  // Supported events:
+  //	Event type 0 (EV_SYN)
+  //	Event type 1 (EV_KEY)
+  //		Event code 256 (BTN_0)
+  //	Event type 2 (EV_REL)
+  //		Event code 7 (REL_DIAL)
+  //	Event type 4 (EV_MSC)
+  //		Event code 1 (MSC_PULSELED)
+  // -------------------------------------------------------------------
+  
+  // Switch to a case based on the event type
+  switch(ev->type)
+  {
     case EV_SYN:				// no need to do anything
 //      printf("SYN REPORT\n");
       break; 
     case EV_MSC:				// unused for this ROS publisher
-      printf("The LED pulse settings were changed; code=0x%04x, value=0x%08x\n", ev->code, ev->value);
+      ROS_INFO("The LED pulse settings were changed; code=0x%04x, value=0x%08x\n", ev->code, ev->value);
       break;
-    case EV_REL:				// ROS publisher: getting rotational data
+    case EV_REL:				// Upon receiving rotation data
       if(ev->code != REL_DIAL)
-	fprintf(stderr, "Warning: unexpected rotation event; ev->code = 0x%04x\n", ev->code);
-      else {
-	signed char dir = (signed char)ev->value;// reads direction value from dial
-	total_shift += (long long)dir;		// integrates consecutive dir values to find total shift
-	msg.direction = dir;			// putting msg together
-	msg.integral = total_shift;
-	msg.is_pressed = pressed;
-	msg.push_state_changed = false;
-	pub.publish(msg);			// publish msg
+	ROS_WARN("Unexpected rotation event; ev->code = 0x%04x\n", ev->code);
+      else
+      {
+	// Reads direction value from turn knob
+	signed char dir = (signed char)ev->value;
+	// Sums consecutive dir values to find integral
+	integral_ += (long long)dir;
+	// Composing a ros_message
+	ros_message.direction = dir;
+	ros_message.integral = integral_;
+	ros_message.is_pressed = pressed_;
+	ros_message.push_state_changed = false;
+	// Publish ros_message
+	ros_publisher.publish( ros_message );
 	//printf("Button was rotated %d units; Shift from start is now %d units\n", (int)ev->value, total_shift);
       }
       break;
-    case EV_KEY:				// ROS publisher: getting data about pressing and depressing the dial button
+    case EV_KEY:				// Upon receiving data about pressing and depressing the dial button
       if(ev->code != BTN_0)
-	fprintf(stderr, "Warning: unexpected key event; ev->code = 0x%04x\n", ev->code);
-      else {
+	ROS_WARN("Unexpected key event; ev->code = 0x%04x\n", ev->code);
+      else
+      {
+	// reads EV_KEY value, converts it to bool
+	pressed_ = (bool)ev->value;
+	// Composing a ros_message
+	ros_message.direction = 0;
+	ros_message.integral = integral_;
+	ros_message.is_pressed = pressed_;
+	ros_message.push_state_changed = true;
+	// Publish ros_message
+	ros_publisher.publish( ros_message );
 	//printf("Button was %s\n", ev->value? "pressed":"released");
-	pressed = (signed char)ev->value;	// reads EV_KEY value
-	msg.direction = 0;			// putting msg together; in the case of KEY EVENT, direction is 0
-	msg.integral = total_shift;
-	msg.is_pressed = pressed;
-	msg.push_state_changed = true;
-	pub.publish(msg);			// publish msg
       }
       break;
     default:					// default case
-      fprintf(stderr, "Warning: unexpected event type; ev->type = 0x%04x\n", ev->type);
+      ROS_WARN("Unexpected event type; ev->type = 0x%04x\n", ev->type);
   } // end switch
 
   fflush(stdout);
-} // end process_event
+} // end processEvent
 
-/** Method for initiating ROS publisher and reading the event data.
- *  @param fd file descriptor for powermate event file.
+/** Method for reading the event data and ROS spinning.
+ *  @param ros_publisher ROS publisher used to publish PowermateEvent message.
  */
-void watch_powermate(int fd) {
-
-  ros::NodeHandle nh("~");
-
-  // Creates publisher that advertises Dial messages on rostopic /griffin_powermate/events
-  ros::Publisher pub_powermate_events = nh.advertise<griffin_powermate::PowermateEvent>("events", 100);
-
-  struct input_event ibuffer[BUFFER_SIZE];				// see: https://www.kernel.org/doc/Documentation/input/input.txt
+void PowerMate::spinPowerMate(ros::Publisher& ros_publisher)
+{
+  int const BUFFER_SIZE = 32;
+  
+  // see: https://www.kernel.org/doc/Documentation/input/input.txt
+  struct input_event ibuffer[BUFFER_SIZE];
   int r, events, i;
 
-  while(ros::ok()){
-//    ROS_INFO("ROS OK begin while");
-    
+  while( ros::ok() )
+  {  
     // read() reads a binary file [http://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html] and returns the number of bytes read.
-    // The program waits in read() until there's something to read; thus it always gets a new event but ROS cannot make a clean exit while in read(). It's not a big problem.
-    r = read(fd, ibuffer, sizeof(struct input_event) * BUFFER_SIZE);
-    if( r > 0 ) {
-      events = r / sizeof(struct input_event);				// getting the number of events
-      for(i=0; i<events; i++)						// going through all the read events
-	process_event(&ibuffer[i], pub_powermate_events);			// call process_event() for every read event
-    } else {
-	fprintf(stderr, "read() failed: %s\n", strerror(errno));	// let user know that read() failed
-	return;
-    }
-    
+    // The program waits in read() until there's something to read; thus it always gets a new event but ROS cannot make a clean exit while in read().
+    // TODO: Figure out a way for ROS to exit cleanly.
+    r = read(descriptor_, ibuffer, sizeof(struct input_event) * BUFFER_SIZE);
+    if( r > 0 )
+    {
+      // Calculate the number of events
+      events = r / sizeof(struct input_event);
+      // Go through each read events
+      for(i = 0; i < events; i++)
+      {
+	// Process event and publish data
+	processEvent(&ibuffer[i], ros_publisher);
+	// spin
+	ros::spinOnce();
+      } // end for
+    } // end if
+    else
+    {
+      // Let user know if read() has failed
+      ROS_WARN("read() failed.\n");
+      return;
+    } // end else
+
   } // end while
   
   return;
-} // end watch_powermate
+} // end spinPowerMate
 
 /** Main method. */
 int main(int argc, char *argv[])
 {
-  
+  // ROS init
   ros::init(argc, argv, "griffin_powermate");
-  ros::AsyncSpinner spinner(1);				// using async spinner
-  spinner.start();					// starting async spinner
   
-  int powermate = -1;					// by default, powermate is considered not opened
-
-  if(argc == 1)
-    powermate = find_powermate(O_RDONLY); 		// if no arguments, find powermate from existing input events
-  else
-    powermate = open_powermate(argv[1], O_RDONLY);	// open the given input event
-
-  if(powermate < 0){					// if failed to open any powermate input event, print info and exit
-    fprintf(stderr, "Unable to locate powermate\n");
-    fprintf(stderr, "Try: %s [device]\n", argv[0]);
-    return 1;
+  // Private nodehandle for ROS
+  ros::NodeHandle pnh("~");
+  
+  // Getting user-specified path from ROS parameter server
+  std::string powermate_path;
+  pnh.param<std::string>("path", powermate_path, "");
+  
+  // Let's construct PowerMate object 
+  PowerMate powermate(powermate_path);
+  
+  // If failed to open any PowerMate USB device, print info and exit
+  if( !powermate.isReadable() )
+  {
+    ROS_ERROR("Unable to locate any PowerMate device.");
+    ROS_INFO("You may try specifying path as ROS parameter, e.g., rosrun griffin_powermate griffin_powermate _path:=<device_event_path>");
+    return -1;
   }
 
-  watch_powermate(powermate);				// if powermate is succesfully opened, read its input
+  // Creates publisher that advertises griffin_powermate::PowermateEvent messages on topic /griffin_powermate/events
+  ros::Publisher pub_powermate_events = pnh.advertise<griffin_powermate::PowermateEvent>("events", 100);
+  
+  // After PowerMate is succesfully opened, read its input, publish ROS messages, and spin.
+  powermate.spinPowerMate(pub_powermate_events);
 
-  close(powermate);					// close powermate
+  // Close PowerMate
+  powermate.closePowerMate();
 
   return 0;
 } //end main

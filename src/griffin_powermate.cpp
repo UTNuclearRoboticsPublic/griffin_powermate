@@ -231,35 +231,41 @@ void PowerMate::spinPowerMate(ros::Publisher& ros_publisher)
   struct input_event ibuffer[BUFFER_SIZE];
   int r, events, i;
 
+  // set the descriptor non-blocking
+  int flags = fcntl(descriptor_, F_GETFL, 0);
+  fcntl(descriptor_, F_SETFL, flags | O_NONBLOCK);
+
   while( ros::ok() )
-  {  
-    // read() reads a binary file [http://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html] and returns the number of bytes read.
-    // The program waits in read() until there's something to read; thus it always gets a new event but ROS cannot make a clean exit while in read().
-    // TODO: Figure out a way for ROS to exit cleanly.
+  {
+    // read() reads a binary file
+    // [http://pubs.opengroup.org/onlinepubs/9699919799/functions/read.html] and returns the number
+    // of bytes read.
     r = read(descriptor_, ibuffer, sizeof(struct input_event) * BUFFER_SIZE);
-    if( r > 0 )
+    if (r == -1)
+    {
+      ros::Rate(100).sleep();
+      continue; // no event yet
+    }
+
+    if (r % (sizeof(struct input_event)) == 0)
     {
       // Calculate the number of events
       events = r / sizeof(struct input_event);
       // Go through each read events
-      for(i = 0; i < events; i++)
+      for (i = 0; i < events; i++)
       {
-	// Process event and publish data
-	processEvent(&ibuffer[i], ros_publisher);
-	// spin
-	ros::spinOnce();
-      } // end for
-    } // end if
+        // Process event and publish data
+        processEvent(&ibuffer[i], ros_publisher);
+        // spin
+        ros::spinOnce();
+      }  // end for
+    }    // end if
     else
     {
       // Let user know if read() has failed
-      ROS_WARN("read() failed.\n");
-      return;
-    } // end else
-
-  } // end while
-  
-  return;
+      ROS_WARN_THROTTLE(1,"Failed to read the PowerMate event packet: unexpected packet size.\n");
+    }  // end else
+  }  // end while
 } // end spinPowerMate
 
 /** Main method. */
